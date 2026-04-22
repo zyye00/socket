@@ -1,0 +1,7 @@
+[tool.ruff]
+preview = true
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "UP", "B", "SIM", "NPY"]
+extend-select = ["A"]
+[tool.ruff.lint.pep8-naming]

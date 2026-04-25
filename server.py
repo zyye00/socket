@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 
 import os
+import pickle
 import socket
-import threading
-from queue import Empty, Queue
-from threading import Lock
 
 import numpy as np
+import zmq
 
-from message import Task, recv_message, send_message
+from message import Result, Task
 
-task_queue = Queue()
 results = {}
-results_lock = Lock()
-pending_tasks = 0
-pending_lock = Lock()
-all_tasks_done = threading.Event()
 
 
 def get_bind_host():
@@ -29,86 +23,87 @@ def get_bind_host():
     return socket.gethostname()
 
 
-def handle_driver(conn, addr):
-    """Send tasks to the driver and receive results"""
-    print(f"[+] Driver connected: {addr}")
+def schedule_next_task(server_socket, identity, tasks, next_task_idx):
+    if next_task_idx < len(tasks):
+        task = tasks[next_task_idx]
+        server_socket.send_multipart([identity, pickle.dumps(task)])
+        print(f"Task {task.id} sent to {identity.decode(errors='ignore')}")
+        return next_task_idx + 1
 
-    try:
-        while True:
-            global pending_tasks
-
-            try:
-                task = task_queue.get(timeout=2)
-            except Empty:
-                break
-
-            send_message(conn, task)
-            print(f"Task {task.id} sent to {addr}")
-
-            result = recv_message(conn)
-
-            with results_lock:
-                results[result.id] = result
-                print(f"[RESULT] Task {result.id} from {addr}: E={result.energy:.6f}")
-
-            with pending_lock:
-                pending_tasks -= 1
-                if pending_tasks == 0:
-                    all_tasks_done.set()
-
-    except Exception as e:
-        print(f"[ERROR] {addr}: {e}")
-    finally:
-        conn.close()
-        print(f"[-] Driver disconnected: {addr}")
-
-
-def accept_drivers(server_socket):
-    while not all_tasks_done.is_set():
-        try:
-            server_socket.settimeout(1)
-            conn, addr = server_socket.accept()
-            t = threading.Thread(target=handle_driver, args=(conn, addr), daemon=True)
-            t.start()
-        except TimeoutError:
-            continue
+    server_socket.send_multipart([identity, pickle.dumps(None)])
+    return next_task_idx
 
 
 def main():
-    global pending_tasks
+    server_info_path = "server_info.txt"
 
-    pending_tasks = num_tasks = 10
-
-    for i in range(num_tasks):
-        task_queue.put(Task(id=i, coords=np.zeros((2, 3))))
+    num_tasks = 10
+    pending_tasks = num_tasks
+    tasks = [Task(id=i, coords=np.zeros((2, 3))) for i in range(num_tasks)]
+    next_task_idx = 0
+    active_drivers = set()
 
     print(f"Created {num_tasks} tasks")
 
     bind_host = get_bind_host()
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("0.0.0.0", 0))
+    context = zmq.Context.instance()
+    server_socket = context.socket(zmq.ROUTER)
 
-        actual_port = s.getsockname()[1]
+    try:
+        server_socket.bind("tcp://*:0")
+        endpoint = server_socket.getsockopt_string(zmq.LAST_ENDPOINT)
+        actual_port = int(endpoint.rsplit(":", 1)[1])
 
-        with open("server_info.txt", "w") as f:
+        with open(server_info_path, "w") as f:
             f.write(f"{bind_host}\n{actual_port}\n")
         print(f"Server info saved to server_info.txt: {bind_host}:{actual_port}")
 
-        s.listen()
         print(f"Waiting for {num_tasks} tasks to complete...\n")
 
-        # Launch an extra thread to accept driver connections
-        accept_thread = threading.Thread(target=accept_drivers, args=(s,), daemon=True)
-        accept_thread.start()
+        while pending_tasks > 0:
+            identity, data = server_socket.recv_multipart()
+            message = pickle.loads(data)
+            driver_name = identity.decode(errors="ignore")
 
-        all_tasks_done.wait()
+            if identity not in active_drivers:
+                active_drivers.add(identity)
+                print(f"[+] Driver connected: {driver_name}")
+
+            if isinstance(message, dict) and message.get("type") == "ready":
+                next_task_idx = schedule_next_task(
+                    server_socket, identity, tasks, next_task_idx
+                )
+                continue
+
+            if isinstance(message, Result):
+                results[message.id] = message
+                print(
+                    f"[RESULT] Task {message.id} from {driver_name}: "
+                    f"E={message.energy:.6f}"
+                )
+
+                pending_tasks -= 1
+                next_task_idx = schedule_next_task(
+                    server_socket, identity, tasks, next_task_idx
+                )
+                continue
+
+            print(f"[ERROR] Unexpected message from {driver_name}: {type(message)}")
 
         print(f"\n[✓] All {num_tasks} tasks completed!")
         print("Results summary:")
         for task_id in sorted(results.keys()):
             energy = results[task_id].energy
             print(f"  Task {task_id}: E={energy:.6f}")
+    finally:
+        server_socket.close()
+        context.term()
+        try:
+            os.remove(server_info_path)
+            print("Removed server_info.txt")
+        except FileNotFoundError:
+            pass
 
 
 if __name__ == "__main__":

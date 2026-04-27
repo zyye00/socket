@@ -1,12 +1,16 @@
 #!/bin/bash
-#SBATCH --job-name=socket-driver
+#SBATCH --job-name=RPC-driver
 #SBATCH --partition=CPU
-#SBATCH --ntasks=2
-#SBATCH --cpus-per-task=4
-#SBATCH --time=00:01:00
-#SBATCH --output=driver.%j.%t.out
+#SBATCH --nodes=1
+#SBATCH --ntasks=4
+#SBATCH --cpus-per-task=1
+#SBATCH --array=0-1%2
+#SBATCH --time=00:30:00
+#SBATCH --output=driver.%A.%a.out
 
 set -euo pipefail
 
-echo "Starting drivers..."
-srun python -u my_driver.py
+module load  orca/6.1.1
+
+echo "Starting driver ${SLURM_ARRAY_TASK_ID}..."
+python -u driver.py

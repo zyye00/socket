@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=socket-master
+#SBATCH --job-name=RPC-server
 #SBATCH --partition=CPU
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
-#SBATCH --time=00:05:00
-#SBATCH --output=master.%j.out
+#SBATCH --time=00:30:00
+#SBATCH --output=server.%j.out
 
 set -euo pipefail
 
-echo "Starting master..."
-python -u my_master.py
+echo "Starting server..."
+python -u server.py

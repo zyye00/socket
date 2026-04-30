@@ -31,17 +31,98 @@ def get_bind_host():
     return socket.gethostname()
 
 
+def create_round_tasks(coords, displacement, num_tasks, round_idx):
+    multiplier = 1 if round_idx == 0 else 2
+    tasks = [
+        Task(id=i, coords=coords + displacement * i * multiplier)
+        for i in range(num_tasks)
+    ]
+    return tasks, multiplier
+
+
 def schedule_next_task(server_socket, identity, tasks, next_task_idx):
-    if next_task_idx is None:
-        return None
+    if next_task_idx >= len(tasks):
+        return next_task_idx
 
-    if next_task_idx < len(tasks):
-        task = tasks[next_task_idx]
-        server_socket.send_multipart([identity, pickle.dumps(task)])
-        print(f"Task {task.id} sent to {identity.decode(errors='ignore')}")
-        return next_task_idx + 1
+    task = tasks[next_task_idx]
+    server_socket.send_multipart([identity, pickle.dumps(task)])
+    print(f"Task {task.id} sent to {identity.decode(errors='ignore')}")
+    return next_task_idx + 1
 
+
+def dispatch_idle_drivers(server_socket, idle_drivers, tasks, next_task_idx):
+    while idle_drivers and next_task_idx < len(tasks):
+        identity = idle_drivers.pop()
+        next_task_idx = schedule_next_task(
+            server_socket, identity, tasks, next_task_idx
+        )
     return next_task_idx
+
+
+def handle_driver_message(
+    identity,
+    message,
+    active_drivers,
+    idle_drivers,
+    round_results,
+    round_number,
+):
+    driver_name = identity.decode(errors="ignore")
+
+    if identity not in active_drivers:
+        active_drivers.add(identity)
+        print(f"[+] Driver connected: {driver_name}")
+
+    if isinstance(message, dict) and message.get("type") == "ready":
+        idle_drivers.add(identity)
+        return 0
+
+    if isinstance(message, Result):
+        round_results[message.id] = message
+        results[(round_number, message.id)] = message
+        print(
+            f"[ROUND {round_number}] [RESULT] Task {message.id} "
+            f"from {driver_name}: E={message.energy:.6f}"
+        )
+        idle_drivers.add(identity)
+        return 1
+
+    print(f"[ERROR] Unexpected message from {driver_name}: {type(message)}")
+    return 0
+
+
+def run_round(
+    server_socket,
+    tasks,
+    num_tasks,
+    round_number,
+    active_drivers,
+    idle_drivers,
+):
+    round_results = {}
+    pending_tasks = num_tasks
+    next_task_idx = 0
+    round_start = time.time()
+
+    while pending_tasks > 0:
+        next_task_idx = dispatch_idle_drivers(
+            server_socket, idle_drivers, tasks, next_task_idx
+        )
+
+        identity, data = server_socket.recv_multipart()
+        message = pickle.loads(data)
+        completed_tasks = handle_driver_message(
+            identity,
+            message,
+            active_drivers,
+            idle_drivers,
+            round_results,
+            round_number,
+        )
+        pending_tasks -= completed_tasks
+
+    round_end = time.time()
+    return round_results, round_end - round_start
 
 
 def main():
@@ -59,6 +140,7 @@ def main():
                              [0, 0.00, 0],
                              [0, 0.00, 0]])
     active_drivers = set()
+    idle_drivers = set()
 
     bind_host = get_bind_host()
 
@@ -86,72 +168,32 @@ def main():
 
         total_start = time.time()
         for round_idx in range(num_rounds):
-            round_results = {}
-            pending_tasks = num_tasks
-            next_task_idx = 0
-            multiplier = 1 if round_idx == 0 else 2
-            tasks = [
-                Task(id=i, coords=coords + displacement * i * multiplier)
-                for i in range(num_tasks)
-            ]
+            round_number = round_idx + 1
+            tasks, multiplier = create_round_tasks(
+                coords, displacement, num_tasks, round_idx
+            )
 
-            print(f"Created {num_tasks} tasks for round {round_idx}/{num_rounds} ")
             print(
-                f"Waiting for round {round_idx}/{num_rounds} "
+                f"Created {num_tasks} tasks for round {round_number}/{num_rounds} "
+                f"(multiplier={multiplier})"
+            )
+            print(
+                f"Waiting for round {round_number}/{num_rounds} "
                 f"to complete all {num_tasks} tasks...\n"
             )
 
-            if round_idx > 0 and active_drivers:
-                print(
-                    f"Dispatching initial round {round_idx} tasks to "
-                    f"{len(active_drivers)} active drivers"
-                )
-                for identity in active_drivers:
-                    next_task_idx = schedule_next_task(
-                        server_socket, identity, tasks, next_task_idx
-                    )
-
-            round_start = time.time()
-            while pending_tasks > 0:
-                identity, data = server_socket.recv_multipart()
-                message = pickle.loads(data)
-                driver_name = identity.decode(errors="ignore")
-
-                if identity not in active_drivers:
-                    active_drivers.add(identity)
-                    print(f"[+] Driver connected: {driver_name}")
-
-                if isinstance(message, dict) and message.get("type") == "ready":
-                    next_task_idx = schedule_next_task(
-                        server_socket, identity, tasks, next_task_idx
-                    )
-
-                elif isinstance(message, Result):
-                    round_results[message.id] = message
-                    results[(round_idx, message.id)] = message
-                    print(
-                        f"[ROUND {round_idx}] [RESULT] Task {message.id} "
-                        f"from {driver_name}: E={message.energy:.6f}"
-                    )
-
-                    pending_tasks -= 1
-                    next_task_idx = schedule_next_task(
-                        server_socket, identity, tasks, next_task_idx
-                    )
-
-                else:
-                    print(
-                        f"[ERROR] Unexpected message from {driver_name}: "
-                        f"{type(message)}"
-                    )
-
-            round_end = time.time()
-            print(f"\n[ROUND {round_idx}] All {num_tasks} tasks completed!")
-            print(
-                f"[ROUND {round_idx}] Total time: "
-                f"{round_end - round_start:.2f} seconds"
+            round_results, round_elapsed = run_round(
+                server_socket,
+                tasks,
+                num_tasks,
+                round_number,
+                active_drivers,
+                idle_drivers,
             )
-            print(f"[ROUND {round_idx}] Results summary:")
+
+            print(f"\n[ROUND {round_number}] All {num_tasks} tasks completed!")
+            print(f"[ROUND {round_number}] Total time: {round_elapsed:.2f} seconds")
+            print(f"[ROUND {round_number}] Results summary:")
             for task_id in sorted(round_results.keys()):
                 energy = round_results[task_id].energy
                 print(f"  Task {task_id}: E={energy:.6f}")
